@@ -4,3 +4,5 @@ __pycache__/
 data/raw/
 configs/
 .env
+store/
+build/
