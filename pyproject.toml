@@ -6,16 +6,33 @@ dependencies = [
     "aiohttp>=3.14.5",
     "azure-ai-projects>=2.0.0",
     "azure-identity>=1.26.0",
+    "azure-storage-blob>=12.31.0",
+    "duckdb>=2.0.0",
     "fastapi>=0.141.1",
-    "geopandas>=1.1.4",
-    "h3>=4.5.0",
+    "numpy>=2.5.3",
+    "pandas>=3.0.6",
     "pyarrow>=25.0.1",
     "pyyaml>=6.0.3",
     "scikit-learn>=1.9.1",
+    "shapely>=2.1.2",
     "uvicorn>=0.53.0",
 ]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "markdownify>=1.2.3",
+    "pytest>=9.2.0",
 ]
+# Only for building the data tables (prepare_data.py), not in the container image.
+prepare = [
+    "geopandas>=1.1.4",
+    "h3>=4.5.0",
+]
+
+[tool.uv]
+default-groups = ["dev", "prepare"]  # the Dockerfile installs none of them
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
