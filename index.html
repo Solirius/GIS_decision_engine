@@ -557,9 +557,9 @@ document.getElementById('chat-form').onsubmit = async e => {
         const ev = JSON.parse(line);
         if (ev.type === 'text') chatLine('', ev.text);
         else if (ev.type === 'tool') act.tool(ev.name);
-        else if (ev.type === 'config') { await applyConfig(ev.config); act.note(`Saved as configs/${ev.file}`); }
+        else if (ev.type === 'config') { await applyConfig(ev.config); act.note(`Saved as ${ev.file}`); }
         else if (ev.type === 'done') { chatSession = ev.session_id; act.finish(ev.error); if (ev.error) chatLine('err', 'The agent stopped with an error.'); }
-        else if (ev.type === 'error') { act.finish(true); chatLine('err', ev.text); }
+        else if (ev.type === 'error') { chatSession = null; act.finish(true); chatLine('err', ev.text); }  // next message starts a new conversation
       }
     }
   } catch (err) { act.finish(true); chatLine('err', String(err)); }

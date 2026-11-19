@@ -6,19 +6,19 @@ The agent is registered in the Foundry project at first use (a new version only 
 change). Its only Foundry-hosted tool is file search: no web search or code interpreter.
 Auth is Entra ID via DefaultAzureCredential (`az login` locally, managed identity when deployed).
 """
+import asyncio
 import hashlib
 import json
 import os
 import re
-from datetime import datetime
-from pathlib import Path
+from dataclasses import dataclass
+from typing import Callable
 
 import yaml
 from azure.ai.projects.aio import AIProjectClient
 from azure.ai.projects.models import FileSearchTool, FunctionTool, PromptAgentDefinition
 from azure.identity.aio import DefaultAzureCredential
 
-CONFIGS = Path(__file__).parent / "configs"  # every config the agent applies is saved here
 ENDPOINT = os.environ.get("FOUNDRY_PROJECT_ENDPOINT",
                           "https://ai-applications-uk-resource.services.ai.azure.com/api/projects/ai-applications-uk")
 MODEL = os.environ.get("FOUNDRY_MODEL_DEPLOYMENT", "gpt-6-luna")
@@ -85,7 +85,7 @@ TOOLS = [
                  description="Describe zone levels, hard-exclusion layers and features (with distributions and "
                              "the most correlated feature pairs) at a given zone level.",
                  parameters={"type": "object", "properties": {"zones": {
-                     "type": "string", "description": "Zone level: h3_8, h3_7, msoa or boroughs (default h3_8)"}}}),
+                     "type": "string", "description": "Zone level, e.g. h3_8, h3_7, msoa or boroughs (default: the finest)"}}}),
     FunctionTool(name="preview_config", strict=False,
                  description="Evaluate a config (YAML string) without changing the user's map. Returns exclusion "
                              "counts and the top/bottom zones (score mode) or cluster sizes and profiles (cluster mode).",
@@ -108,38 +108,50 @@ def text(obj):
     return obj if isinstance(obj, str) else json.dumps(obj, indent=1)
 
 
-def run_tool(name, args, describe, evaluate, on_apply):
+@dataclass
+class Tools:
+    """What the agent's function tools need from the app, bound to one user and one data release.
+
+    The callables are synchronous; ``chat`` runs them in a worker thread so one user's tool call never pauses
+    other users' requests.
+    """
+    describe: Callable[[str | None], dict]  # zone level (None = base level) -> description (app.describe)
+    evaluate: Callable[[dict], dict]        # config -> summary of its result; raises if invalid (app.evaluate)
+    save_config: Callable[[str], str]       # config YAML -> saved name (state.save_config)
+    claim_conversation: Callable[[str], None]  # new conversation id -> recorded as the user's (state.claim_conversation)
+
+
+def run_tool(name, args, tools, on_apply):
     """Runs one function call from the agent; errors are returned as text so the agent can fix its input.
 
-    ``apply_config`` also saves the YAML to configs/ and hands the config to ``on_apply`` so it can be pushed to
-    the user's map.
+    ``apply_config`` also saves the YAML to the user's configs and hands the config to ``on_apply`` so it can be
+    pushed to the user's map.
 
     Args:
         name: Tool name: ``describe_data``, ``preview_config`` or ``apply_config``.
         args: Tool arguments decoded from the model's JSON (``zones`` or ``config_yaml``).
-        describe: Callable(level) -> dict describing the data (``app.describe``).
-        evaluate: Callable(config dict) -> dict summarising its result, raising on an invalid config
-            (``app.evaluate``).
-        on_apply: Callable(config dict, saved filename) called when ``apply_config`` succeeds.
+        tools: The app's callbacks (``Tools``).
+        on_apply: Callable(config dict, saved name) called when ``apply_config`` succeeds.
 
     Returns:
         The tool output to send back to the model, as text.
     """
     if name == "describe_data":
-        return text(describe(args.get("zones") or "h3_8"))
+        try:
+            return text(tools.describe(args.get("zones")))
+        except ValueError as e:  # unknown zone level: let the agent fix it
+            return str(e)
     if name in ("preview_config", "apply_config"):
         try:
             cfg = yaml.safe_load(args["config_yaml"]) or {}
-            result = evaluate(cfg)  # validates
+            result = tools.evaluate(cfg)  # validates
         except Exception as e:  # invalid YAML or config: let the agent fix it
             return f"Invalid config: {e}"
         if name == "preview_config":
             return text(result)
-        CONFIGS.mkdir(exist_ok=True)
-        path = CONFIGS / f"agent-{datetime.now():%Y%m%d-%H%M%S}.yaml"
-        path.write_text(args["config_yaml"])
-        on_apply(cfg, path.name)
-        return f"Config loaded into the map (saved as configs/{path.name})."
+        saved = tools.save_config(args["config_yaml"])
+        on_apply(cfg, saved)
+        return f"Config loaded into the map (saved as {saved})."
     return f"Unknown tool {name!r}"
 
 
@@ -182,10 +194,11 @@ async def client():
     return _openai
 
 
-async def chat(message, current_config, session_id, describe, evaluate):
+async def chat(message, current_config, session_id, tools):
     """Run one agent turn; yields events for the UI: text, tool, config, done/error.
 
-    session_id is the Foundry conversation id: follow-up messages continue the same conversation.
+    session_id is the Foundry conversation id: follow-up messages continue the same conversation. The caller
+    checks the user may continue it; a new conversation is recorded as the user's with ``tools.claim_conversation``.
 
     The model and the local function tools take turns until the model answers without calling a function, or
     ``MAX_TURNS`` round trips have been made.
@@ -194,8 +207,7 @@ async def chat(message, current_config, session_id, describe, evaluate):
         message: The user's message.
         current_config: The user's current sidebar config as YAML, sent with the message as context.
         session_id: Foundry conversation id from a previous turn, or None to start a new conversation.
-        describe: Callable(level) -> dict for the describe_data tool (``app.describe``).
-        evaluate: Callable(config dict) -> dict for the preview and apply tools (``app.evaluate``).
+        tools: The app's callbacks for the function tools and conversation ownership (``Tools``).
 
     Yields:
         Event dicts: ``{"type": "text", "text"}`` for agent replies (citation markers removed),
@@ -206,7 +218,10 @@ async def chat(message, current_config, session_id, describe, evaluate):
     applied = []
     try:
         openai = await client()
-        conversation = session_id or (await openai.conversations.create()).id
+        conversation = session_id
+        if not conversation:
+            conversation = (await openai.conversations.create()).id
+            await asyncio.to_thread(tools.claim_conversation, conversation)
         items = [{"type": "message", "role": "user",
                   "content": f"{message}\n\n<current_config>\n{current_config}\n</current_config>"}]
         tokens = 0
@@ -225,8 +240,9 @@ async def chat(message, current_config, session_id, describe, evaluate):
                     yield {"type": "tool", "name": "file_search"}
                 elif out.type == "function_call":
                     yield {"type": "tool", "name": out.name}
-                    result = run_tool(out.name, json.loads(out.arguments or "{}"), describe, evaluate,
-                                      lambda cfg, name: applied.append((cfg, name)))
+                    # in a worker thread: scoring or clustering a large level must not pause other users
+                    result = await asyncio.to_thread(run_tool, out.name, json.loads(out.arguments or "{}"), tools,
+                                                     lambda cfg, name: applied.append((cfg, name)))
                     while applied:  # apply_config just ran: push the config to the map straight away
                         cfg, name = applied.pop(0)
                         yield {"type": "config", "config": cfg, "file": name}
