@@ -35,4 +35,4 @@ default-groups = ["dev", "prepare"]  # the Dockerfile installs none of them
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = [".", "tests"]
+pythonpath = [".", "tests", "refresh"]
