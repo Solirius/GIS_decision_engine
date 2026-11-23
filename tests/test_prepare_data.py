@@ -158,6 +158,14 @@ def test_area_weighted_splits_counts_and_averages_the_rest():
     assert df.population[2] == 0 and np.isnan(df.cbd_distance_m[2])  # a zone with no cells: no mean
 
 
+def test_area_weighted_keeps_gaps():
+    cells = gpd.GeoSeries([shapely.box(0, 0, 100, 100), shapely.box(100, 0, 200, 100)], crs=BNG)
+    zones = gpd.GeoSeries([shapely.box(0, 0, 150, 100), shapely.box(0, 0, 100, 100)], crs=BNG)
+    values = np.array([[100.0, 10.0], [np.nan, np.nan]])
+    df = pdata.area_weighted(zones, cells, values, ["population", "cbd_distance_m"])
+    assert np.isnan(df.population[0]) and np.isnan(df.cbd_distance_m[0])  # touches the cell with a gap
+    assert (df.population[1], df.cbd_distance_m[1]) == (100, 10)  # doesn't
+
 
 # --- Full build ----------------------------------------------------------------------------------------------------
 

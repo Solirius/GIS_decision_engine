@@ -60,8 +60,25 @@ def ring(coords):
     return [[round(x, 5), round(y, 5)] for x, y in coords]
 
 
+def nullable(values, decimals):
+    """Round an array for JSON, with None where a value is missing (NaN), since JSON has no NaN.
+
+    Args:
+        values: Float array of any shape.
+        decimals: Decimal places to round to.
+
+    Returns:
+        Nested lists of the same shape: Python floats, or None where ``values`` is NaN.
+    """
+    a = np.round(np.asarray(values, dtype=np.float64), decimals)
+    return np.where(np.isnan(a), None, a).tolist()
+
+
 def load_level(path):
     """Load one zone level's feature table (built by prepare_data.py) into memory.
+
+    Missing values are kept as they are, never filled: the data owner decides what the tables hold. A zone
+    missing a feature has no percentile for it, and percentiles are ranked among the zones that have a value.
 
     Args:
         path: The level's GeoParquet file.
@@ -69,8 +86,9 @@ def load_level(path):
     Returns:
         A ``(features, level)`` tuple. ``features`` lists the feature column names. ``level`` is a dict with:
         ``cells`` (zone id and polygon rings per zone, for the map), ``raw`` (feature values rounded to 1
-        decimal, one row per zone), ``norm`` (percentile rank of each feature in [0, 1], as a float array of
-        shape (zones, features)) and ``cov`` (exclusion layer key -> share of each zone it covers).
+        decimal, one row per zone, None where missing), ``norm`` (percentile rank of each feature in [0, 1], as
+        a float array of shape (zones, features), NaN where missing) and ``cov`` (exclusion layer key -> share of
+        each zone it covers).
     """
     t = duckdb.connect().sql("select * exclude (geometry), geometry::BLOB as wkb from read_parquet($path)",
                              params={"path": str(path)}).to_arrow_table()
@@ -81,7 +99,7 @@ def load_level(path):
         # A zone can have several polygons (e.g. boroughs split by the Thames).
         "cells": [{"id": z, "polys": [ring(p.exterior.coords) for p in shapely.get_parts(geom)]}
                   for z, geom in zip(g.zone_id, geoms)],
-        "raw": g[feats].round(1).to_numpy().tolist(),
+        "raw": nullable(g[feats].to_numpy(dtype=np.float64), 1),
         # Percentile-rank each feature to [0, 1] so weights are comparable despite skew/units.
         "norm": g[feats].rank(pct=True).to_numpy(dtype=np.float64),
         "cov": {c[4:]: g[c].to_numpy() for c in g.columns if c.startswith("cov_")},
@@ -251,7 +269,8 @@ def meta(level: str | None = None):
     Returns:
         Dict with the data ``version``, the available ``levels``, the hard ``exclusions``, the ``features`` (key,
         label, group, default weight and how base cells were aggregated), the zone ``cells`` (polygons), the
-        ``raw`` feature values per zone and each exclusion layer's ``cov`` share per zone (for the tooltip).
+        ``raw`` feature values per zone (None where missing) and each exclusion layer's ``cov`` share per zone
+        (for the tooltip).
 
     Raises:
         HTTPException: 422 if ``level`` is not a known zone level.
@@ -266,7 +285,7 @@ def meta(level: str | None = None):
                      for c in ds.features],
         "cells": L["cells"],
         "raw": L["raw"],
-        "cov": {g: np.round(L["cov"][g], 3).tolist() for g in EXCLUSIONS},  # for the tooltip
+        "cov": {g: nullable(L["cov"][g], 3) for g in EXCLUSIONS},  # for the tooltip
     }
 
 
@@ -295,15 +314,29 @@ def excluded_mask(ds, body):
     return mask
 
 
-def with_gaps(values, mask):
-    """Full-length list with None for excluded zones.
+def missing_mask(L, cols):
+    """Zones missing a value for any of the given features.
 
     Args:
-        values: One value per surviving zone, in zone order.
-        mask: Boolean exclusion mask from ``excluded_mask``, one entry per zone.
+        L: A level's data (see ``load_level``).
+        cols: Feature column indices.
 
     Returns:
-        List as long as ``mask``: the values in the positions of non-excluded zones, None elsewhere.
+        Boolean array with one entry per zone, True where any of ``cols`` is missing (all False if ``cols`` is
+        empty).
+    """
+    return np.isnan(L["norm"][:, cols]).any(axis=1)
+
+
+def with_gaps(values, mask):
+    """Full-length list with None for zones left out (excluded, or missing data).
+
+    Args:
+        values: One value per zone kept, in zone order.
+        mask: Boolean mask, one entry per zone, True for zones left out.
+
+    Returns:
+        List as long as ``mask``: the values in the positions of kept zones, None elsewhere.
     """
     out = [None] * len(mask)
     for i, v in zip(np.flatnonzero(~mask), values):
@@ -314,27 +347,32 @@ def with_gaps(values, mask):
 def score_zones(ds, body):
     """Score every zone as a weighted sum of feature percentiles.
 
-    The score of a zone is the sum of weight x feature percentile over the weighted features. Scores are then
-    turned into percentiles among the zones that survive the hard exclusions.
+    The score of a zone is the sum of weight x feature percentile over the weighted features. A zone missing
+    a value for any feature with a non-zero weight has no score: it is left out, not guessed. Scores are then
+    turned into percentiles among the zones that are scored.
 
     Args:
         ds: Dataset to use.
         body: Feature weights in [-1, 1] (unknown keys are ignored), zone level and enabled exclusions.
 
     Returns:
-        Dict with ``pct``, the score percentile of each zone rounded to 4 decimals (None for excluded zones,
-        0.5 for all zones when every weight is zero), ``excluded``, the number of excluded zones, and the data
-        ``version``.
+        Dict with ``pct``, the score percentile of each zone rounded to 4 decimals (None for zones excluded or
+        missing data, 0.5 for every other zone when every weight is zero), ``excluded``, the number of excluded
+        zones, ``missing``, the indices of the zones left unscored for missing data (excluded zones aren't
+        listed), and the data ``version``.
     """
     w = np.zeros(len(ds.features))
     for k, v in body.weights.items():
         if k in ds.idx:
             w[ds.idx[k]] = v
-    mask = excluded_mask(ds, body)
-    norm = ds.level(body.level)["norm"][~mask]
-    # Percentiles are ranked among the zones that survive the exclusions.
-    pct = pd.Series(norm @ w).rank(pct=True).to_numpy() if w.any() else np.full(len(norm), 0.5)
-    return {"pct": with_gaps(np.round(pct, 4).tolist(), mask), "excluded": int(mask.sum()), "version": ds.version}
+    L = ds.level(body.level)
+    excluded = excluded_mask(ds, body)
+    missing = ~excluded & missing_mask(L, np.flatnonzero(w))
+    left_out = excluded | missing
+    norm = L["norm"][~left_out][:, w != 0]
+    pct = pd.Series(norm @ w[w != 0]).rank(pct=True).to_numpy() if w.any() else np.full(len(norm), 0.5)
+    return {"pct": with_gaps(np.round(pct, 4).tolist(), left_out), "excluded": int(excluded.sum()),
+            "missing": np.flatnonzero(missing).tolist(), "version": ds.version}
 
 
 @app.post("/score")
@@ -348,7 +386,7 @@ class ClusterRequest(Weights):
 
 
 def cluster_zones(ds, body):
-    """Group the surviving zones with k-means on the percentiles of the switched-on features.
+    """Group the zones with k-means on the percentiles of the switched-on features.
 
     Weights are ignored: only which features are present in ``body.weights`` matters. The seed is fixed and
     clusters are numbered from largest to smallest, so the same inputs always give the same labels and colours.
@@ -356,20 +394,26 @@ def cluster_zones(ds, body):
     Args:
         ds: Dataset to use.
         body: Switched-on features (as ``weights`` keys), zone level, enabled exclusions and ``n_clusters``.
-            The number of clusters is capped at the number of surviving zones.
+            The number of clusters is capped at the number of zones clustered.
 
     Returns:
-        Dict with ``labels`` (cluster id per zone, None for excluded zones), ``keys`` (the features used),
-        ``centers`` (one row per cluster: centre percentile 0-100 of each feature in ``keys``), ``excluded``
-        (number of excluded zones) and the data ``version``. With no features, a single cluster or no surviving
-        zones, every zone gets label 0.
+        Dict with ``labels`` (cluster id per zone, None for zones excluded or missing a value for a switched-on
+        feature), ``keys`` (the features used), ``centers`` (one row per cluster: centre percentile 0-100 of
+        each feature in ``keys``), ``excluded`` (number of excluded zones), ``missing`` (indices of the zones left
+        out for missing data; excluded zones aren't listed) and the data ``version``. With no features, a
+        single cluster or no zones left, every zone clustered gets label 0.
     """
-    # Vector per surviving zone = percentiles of the features switched on (weights are ignored).
+    # Vector per zone = percentiles of the features switched on (weights are ignored).
     keys = [k for k in body.weights if k in ds.idx]
-    mask = excluded_mask(ds, body)
-    X = ds.level(body.level)["norm"][~mask][:, [ds.idx[k] for k in keys]]
+    cols = [ds.idx[k] for k in keys]
+    L = ds.level(body.level)
+    excluded = excluded_mask(ds, body)
+    missing = ~excluded & missing_mask(L, cols)
+    mask = excluded | missing
+    X = L["norm"][~mask][:, cols]
     k = max(1, min(body.n_clusters, len(X)))
-    out = {"keys": keys, "excluded": int(mask.sum()), "version": ds.version}
+    out = {"keys": keys, "excluded": int(excluded.sum()), "missing": np.flatnonzero(missing).tolist(),
+           "version": ds.version}
     if not keys or k == 1 or len(X) == 0:
         centers = [np.round(X.mean(0) * 100, 1).tolist()] if len(X) else []
         return out | {"labels": with_gaps([0] * len(X), mask), "centers": centers}
@@ -414,10 +458,12 @@ def describe(ds, level=None):
         level: Zone level key (default: the base level).
 
     Returns:
-        Dict with the number of zones per level (``zone_levels``), the ``described_level``, each feature's
-        label, group, aggregation, description, quartiles and share of zones at zero (``features``), the 12
-        most correlated feature pairs by Spearman correlation (``most_correlated_feature_pairs``) and each
-        exclusion layer's description and zone counts at 50% and full coverage (``hard_exclusions``).
+        Dict with the number of zones per level, and how many miss a value for at least one feature
+        (``zone_levels``), the ``described_level``, each feature's label, group, aggregation, description,
+        quartiles of the zones that have a value (None if none do), share of zones at zero and share missing a
+        value (``features``), the 12 most correlated feature pairs by Spearman correlation over the zones that
+        have both values (``most_correlated_feature_pairs``) and each exclusion layer's description and zone
+        counts at 50% and full coverage (``hard_exclusions``).
 
     Raises:
         ValueError: If ``level`` is not a known zone level.
@@ -431,15 +477,20 @@ def describe(ds, level=None):
     features = []
     for c in feats:
         col = raw[:, idx[c]]
-        q = np.percentile(col, [0, 25, 50, 75, 100]).round(1).tolist()
+        known = col[~np.isnan(col)]
+        q = np.percentile(known, [0, 25, 50, 75, 100]).round(1).tolist() if len(known) else None
         features.append({"key": c, "label": label(c), "group": group(c), "aggregation": ds.agg[c],
                          "description": DESCRIPTIONS.get(c) or f"Count of {label(c).lower()} points of interest (Overture)",
-                         "min_p25_median_p75_max": q, "share_of_zones_zero": round(float((col == 0).mean()), 2)})
-    corr = np.corrcoef(L["norm"].T)  # Spearman, since norm holds ranks
+                         "min_p25_median_p75_max": q, "share_of_zones_zero": round(float((col == 0).mean()), 2),
+                         "share_of_zones_missing": round(float(np.isnan(col).mean()), 2)})
+    corr = pd.DataFrame(L["norm"]).corr().to_numpy()  # Spearman, since norm holds ranks; pairwise over known values
     pairs = sorted(((abs(corr[i, j]), feats[i], feats[j], round(float(corr[i, j]), 2))
-                    for i in range(len(feats)) for j in range(i + 1, len(feats))), reverse=True)[:12]
+                    for i in range(len(feats)) for j in range(i + 1, len(feats)) if not np.isnan(corr[i, j])),
+                   reverse=True)[:12]
     return {
-        "zone_levels": {k: {"label": v, "zones": len(ds.levels[k]["norm"])} for k, v in ds.labels.items()},
+        "zone_levels": {k: {"label": v, "zones": len(ds.levels[k]["norm"]),
+                            "zones_missing_data": int(np.isnan(ds.levels[k]["norm"]).any(axis=1).sum())}
+                        for k, v in ds.labels.items()},
         "described_level": level,
         "features": features,
         "most_correlated_feature_pairs": [{"a": a, "b": b, "spearman": r} for _, a, b, r in pairs],
@@ -494,7 +545,8 @@ def evaluate(ds, cfg):
         cfg: Parsed config in the export format (see ``parse_config``).
 
     Returns:
-        Dict with the ``zones`` level, ``mode``, ``total_zones`` and ``excluded`` count. In cluster mode it also
+        Dict with the ``zones`` level, ``mode``, ``total_zones``, ``excluded`` count and the number of zones left
+        out because they miss a value for an enabled feature (``missing_data``). In cluster mode it also
         has ``cluster_sizes`` and ``cluster_centre_percentiles`` (feature -> centre percentile, per cluster). In
         score mode it has ``top_10`` and ``bottom_5``: zone id, score percentile and raw values of the enabled
         features.
@@ -510,14 +562,14 @@ def evaluate(ds, cfg):
     if mode == "cluster":
         r = cluster_zones(ds, req)
         labels = [v for v in r["labels"] if v is not None]
-        out |= {"excluded": r["excluded"], "cluster_sizes": np.bincount(labels).tolist() if labels else [],
+        out |= {"excluded": r["excluded"], "missing_data": len(r["missing"]), "cluster_sizes": np.bincount(labels).tolist() if labels else [],
                 "cluster_centre_percentiles": [dict(zip(r["keys"], c)) for c in r["centers"]]}
         return out
     r = score_zones(ds, req)
     ranked = sorted((p, i) for i, p in enumerate(r["pct"]) if p is not None)
     row = lambda p, i: {"zone": ids[i], "score_percentile": round(p * 100),
                         **{f: L["raw"][i][ds.idx[f]] for f in enabled}}
-    out |= {"excluded": r["excluded"], "top_10": [row(p, i) for p, i in ranked[::-1][:10]],
+    out |= {"excluded": r["excluded"], "missing_data": len(r["missing"]), "top_10": [row(p, i) for p, i in ranked[::-1][:10]],
             "bottom_5": [row(p, i) for p, i in ranked[:5]]}
     return out
 

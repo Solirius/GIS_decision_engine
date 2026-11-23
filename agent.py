@@ -35,6 +35,9 @@ How the engine works:
 - Each feature is converted to a percentile (0-1) across zones. Score = sum of weight x percentile over the \
 enabled features (weights in [-1, 1]), then shown as a percentile among non-excluded zones.
 - Hard exclusions remove a zone when an enabled layer covers at least its threshold share of the zone (0.05-1).
+- Missing data is never filled in: a zone with no value for an enabled feature gets no score (or cluster) and \
+is left out of the percentiles. describe_data reports how many zones miss each feature and preview_config how \
+many zones a config leaves out for it (missing_data). If a feature you want leaves many zones out, say so.
 - "cluster" mode runs k-means on the percentiles of the enabled features instead (weights are ignored).
 
 You also have Homes England programme documents (funding guidance and prospectuses), searchable with \

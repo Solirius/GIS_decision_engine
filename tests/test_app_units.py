@@ -256,7 +256,7 @@ def test_cluster_weights_are_ignored(ds):
 def test_describe(ds):
     d = app.describe(ds, "boroughs")
     assert d["described_level"] == "boroughs"
-    assert d["zone_levels"]["boroughs"] == {"label": "Boroughs", "zones": 33}
+    assert d["zone_levels"]["boroughs"] == {"label": "Boroughs", "zones": 33, "zones_missing_data": 0}
     assert [f["key"] for f in d["features"]] == ds.features
     pop = next(f for f in d["features"] if f["key"] == "population")
     assert pop["description"] == "Resident population" and pop["aggregation"] == "sum" and pop["group"] == "Core"
@@ -418,3 +418,132 @@ def test_chat_refuses_an_unknown_conversation(client, state_dir, monkeypatch):
     monkeypatch.setattr(app.agent, "chat", never)
     r = client.post("/chat", json={"message": "hi", "session_id": "conv_forgotten"})
     assert json.loads(r.text) == {"type": "error", "text": "Unknown conversation: start a new one"}
+
+
+# --- Missing data: kept as gaps, never filled ----------------------------------------------------------------------
+
+NAN = float("nan")
+
+
+def test_nullable():
+    assert app.nullable([1.234, NAN], 1) == [1.2, None]
+    assert app.nullable([[NAN, 2.0]], 0) == [[None, 2.0]]
+    out = app.nullable(np.array([0.12345]), 3)
+    assert out == [0.123] and type(out[0]) is float
+    json.dumps(app.nullable([NAN, 1], 1), allow_nan=False)
+
+
+@pytest.fixture(scope="module")
+def gappy(tmp_path_factory):
+    """data/levels' msoa and boroughs tables with some values blanked out, as a release folder and manifest.
+    Boroughs 0-2 miss cbd_distance_m, borough 3 misses population and borough 4 its flood coverage; MSOA 0
+    misses cbd_distance_m."""
+    folder = tmp_path_factory.mktemp("gappy")
+    (folder / "levels").mkdir()
+    for key, blanks in {"boroughs": {"cbd_distance_m": [0, 1, 2], "population": [3], "cov_flood": [4]},
+                        "msoa": {"cbd_distance_m": [0]}}.items():
+        g = gpd.read_parquet(LEVELS / f"{key}.parquet")
+        for col, rows in blanks.items():
+            g.loc[rows, col] = np.nan
+        g.to_parquet(folder / "levels" / f"{key}.parquet")
+    return folder, release.build_manifest(folder / "levels", "gappy")
+
+
+@pytest.fixture(scope="module")
+def gds(gappy):
+    return app.Dataset(*gappy)
+
+
+def test_gaps_load_as_none_and_nan(gds):
+    L, i = gds.levels["boroughs"], gds.idx["cbd_distance_m"]
+    assert [row[i] for row in L["raw"][:4]] == [None, None, None, L["raw"][3][i]] and L["raw"][3][i] is not None
+    assert np.isnan(L["norm"][:3, i]).all() and not np.isnan(L["norm"][3:, i]).any()
+    assert np.nanmax(L["norm"][:, i]) == 1.0 and np.nanmin(L["norm"][:, i]) == pytest.approx(1 / 30)  # among 30
+    assert np.isnan(L["cov"]["flood"][4])
+
+
+def test_zones_missing_a_weighted_feature_get_no_score(gds):
+    r = app.score_zones(gds, req({"cbd_distance_m": 1, "population": 0.5}, level="boroughs"))
+    assert r["missing"] == [0, 1, 2, 3] and r["excluded"] == 0
+    assert r["pct"][:4] == [None] * 4 and None not in r["pct"][4:]
+    scored = [p for p in r["pct"] if p is not None]
+    assert max(scored) == 1.0 and min(scored) == pytest.approx(1 / 29, abs=1e-4)  # ranked among the 29 scored
+
+
+def test_a_feature_with_zero_weight_needs_no_value(gds):
+    r = app.score_zones(gds, req({"cbd_distance_m": 0, "station_count": 1}, level="boroughs"))
+    assert r["missing"] == [] and None not in r["pct"]
+
+
+def test_excluded_zones_are_not_reported_as_missing(gds):
+    flood = gds.levels["boroughs"]["cov"]["flood"]
+    r = app.score_zones(gds, req({"cbd_distance_m": 1}, level="boroughs", exclusions={"flood": 0.05}))
+    excluded = {i for i, c in enumerate(flood) if c >= 0.05}
+    assert r["excluded"] == len(excluded) > 0 and not set(r["missing"]) & excluded
+    assert set(r["missing"]) == {0, 1, 2} - excluded
+    assert 4 not in excluded and r["pct"][4] is not None  # unknown flood coverage doesn't exclude
+
+
+def test_zones_missing_a_clustered_feature_are_left_out(gds):
+    r = app.cluster_zones(gds, req({"cbd_distance_m": 1, "station_count": 1}, level="boroughs", n_clusters=3))
+    assert r["missing"] == [0, 1, 2] and r["labels"][:3] == [None] * 3
+    assert sorted(set(r["labels"][3:])) == [0, 1, 2] and all(not np.isnan(c).any() for c in r["centers"])
+    one = app.cluster_zones(gds, req({"population": 1}, level="boroughs", n_clusters=1))
+    assert one["missing"] == [3] and one["labels"][3] is None and one["centers"][0][0] == pytest.approx(
+        np.nanmean(gds.levels["boroughs"]["norm"][:, gds.idx["population"]]) * 100, abs=0.05)
+
+
+def test_describe_reports_gaps(gds):
+    d = app.describe(gds, "boroughs")
+    assert d["zone_levels"]["boroughs"]["zones_missing_data"] == 4  # the flood coverage gap isn't a feature
+    assert d["zone_levels"]["msoa"]["zones_missing_data"] == 1
+    cbd = next(f for f in d["features"] if f["key"] == "cbd_distance_m")
+    assert cbd["share_of_zones_missing"] == round(3 / 33, 2) and None not in cbd["min_p25_median_p75_max"]
+    assert next(f for f in d["features"] if f["key"] == "poi_lodging")["share_of_zones_missing"] == 0
+    json.dumps(d, allow_nan=False)
+
+
+def test_describe_with_a_feature_missing_everywhere(gds):
+    L = gds.levels["msoa"]
+    i = gds.idx["station_count"]
+    saved = (L["norm"].copy(), [row[i] for row in L["raw"]])
+    try:
+        L["norm"] = L["norm"].copy()
+        L["norm"][:, i] = NAN
+        for row in L["raw"]:
+            row[i] = None
+        d = app.describe(gds, "msoa")
+    finally:
+        L["norm"] = saved[0]
+        for row, v in zip(L["raw"], saved[1]):
+            row[i] = v
+    sc = next(f for f in d["features"] if f["key"] == "station_count")
+    assert sc["min_p25_median_p75_max"] is None and sc["share_of_zones_missing"] == 1
+    assert all("station_count" not in (p["a"], p["b"]) for p in d["most_correlated_feature_pairs"])
+    json.dumps(d, allow_nan=False)
+
+
+def test_evaluate_reports_zones_left_out_for_missing_data(gds):
+    cfg = {"zones": "boroughs", "features": {"cbd_distance_m": {"enabled": True, "weight": 1}}}
+    out = app.evaluate(gds, cfg)
+    assert out["missing_data"] == 3 and len(out["top_10"]) == 10
+    gaps = {c["id"] for c in gds.levels["boroughs"]["cells"][:3]}
+    assert gaps.isdisjoint(r["zone"] for r in out["top_10"] + out["bottom_5"])
+    assert app.evaluate(gds, cfg | {"mode": "cluster"})["missing_data"] == 3
+
+
+def test_the_api_sends_gaps_as_null(gappy, state_dir, tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    store = LocalStore(tmp_path / "data")
+    release.publish(store, gappy[0] / "levels", promote_it=True)
+    monkeypatch.setenv("DATA_STORE_URL", str(store.root))
+    monkeypatch.setattr(app, "CACHE", tmp_path / "cache")
+    with TestClient(app.app) as c:
+        m = json.loads(c.get("/meta?level=boroughs").text)
+        cols = [f["key"] for f in m["features"]]
+        assert [row[cols.index("cbd_distance_m")] for row in m["raw"][:3]] == [None] * 3
+        assert m["cov"]["flood"][4] is None
+        s = c.post("/score", json={"weights": {"cbd_distance_m": 1}, "level": "boroughs"}).json()
+        assert s["missing"] == [0, 1, 2] and s["pct"][:3] == [None] * 3
+        k = c.post("/cluster", json={"weights": {"population": 1}, "level": "boroughs", "n_clusters": 2}).json()
+        assert k["missing"] == [3] and k["labels"][3] is None

@@ -74,8 +74,14 @@
     border-radius: 6px; padding: 6px 8px; font: inherit; }
   #chat form button { flex: none; width: auto; padding: 0 14px; background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   #chat form button:disabled { opacity: 0.5; cursor: default; }
-  #profile, #deciles { position: absolute; right: 12px; bottom: 36px; z-index: 1; max-height: calc(100% - 60px); overflow: auto;
-    background: #171b21ee; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; font-size: 11px; }
+  #legend { position: absolute; right: 12px; bottom: 36px; z-index: 1; max-height: calc(100% - 60px);
+    display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+  #profile, #deciles, #gaps { overflow: auto; background: #171b21ee; border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px 14px; font-size: 11px; }
+  #gaps { flex: none; width: auto; padding: 7px 12px; color: #ffb020; text-align: left; }
+  #gaps:hover, #gaps.on { border-color: #ffb020; }
+  #gaps.on { background: #ffb02022; }
+  #gaps small { color: var(--muted); margin-left: 6px; }
   #profile h3, #deciles h3 { margin: 0 0 8px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
   #profile table { border-collapse: separate; border-spacing: 2px; }
   #profile th { font-weight: 500; color: var(--muted); padding: 0 4px 4px; cursor: default; white-space: nowrap; }
@@ -108,6 +114,7 @@
   .tip table { border-spacing: 0; margin-top: 4px; }
   .tip td { padding: 0 0 0 12px; text-align: right; font-variant-numeric: tabular-nums; }
   .tip td:first-child { padding: 0; text-align: left; color: #aab2bf; }
+  .tip td.gap { color: #ff6b5e; font-style: italic; }
 </style>
 </head>
 <body>
@@ -125,7 +132,8 @@
   </header>
   <div id="features"></div>
 </aside>
-<div id="map"><div id="profile" hidden></div><div id="deciles"></div>
+<div id="map"><div id="legend"><div id="profile" hidden></div><div id="deciles"></div>
+    <button id="gaps" hidden title="Zones with no value for at least one feature. Hover to light them up on the map; click to keep them lit."></button></div>
   <button id="params-open" hidden>Parameters</button>
   <button id="chat-open" hidden>Ask the agent</button>
 </div>
@@ -140,9 +148,12 @@ const state = {};          // key -> {on, w}
 const excl = {};          // hard exclusion layer key -> {on, t}: excluded if coverage >= t
 let exclusions, excludedCount = 0;
 let features, cells, raw, cov, vals, profile, highlight = null, level, baseLevel, mode = 'score', version = 0;   // vals: percentile or cluster id per zone
+// Missing data is never filled in. gapZones: per zone, whether any feature has no value (null in raw);
+// missing: zones left without a score or cluster because a feature in use has no value; gapsPinned: keep gaps lit.
+let gapZones = [], missing = new Set(), gapsPinned = false;
 const DESC = {
-  score: 'Score = Σ weight × feature percentile, shown as percentile among non-excluded zones.',
-  cluster: 'K-means on the percentiles of the features switched on (weights ignored).',
+  score: 'Score = Σ weight × feature percentile, shown as percentile among scored zones. Zones excluded, or missing a value for a weighted feature, get no score.',
+  cluster: 'K-means on the percentiles of the features switched on (weights ignored). Zones missing a value for one of them are left out.',
 };
 
 const RED = [215, 48, 39], WHITE = [255, 255, 255], GREEN = [26, 152, 80];
@@ -163,6 +174,8 @@ const scoreColor = p => p < 0.5 ? mix(RED, WHITE, p * 2) : mix(WHITE, GREEN, (p 
 const TAB10 = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
   .map(h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)));
 const EXCLUDED = [110, 116, 128, 70];
+const NO_DATA = [150, 110, 40, 110];   // no score because of missing data
+const GAP = [255, 176, 32];            // zones with missing data, when lit up from the legend
 /**
  * Decile a score percentile falls in.
  * @param {number} p - Percentile in [0, 1].
@@ -170,17 +183,50 @@ const EXCLUDED = [110, 116, 128, 70];
  */
 const decile = p => Math.min(9, Math.floor(p * 10));
 /**
- * Fill colour of a zone on the map.
- * highlight = hovered cluster (cluster mode) or decile (score mode); everything else fades.
- * @param {?number} v - The zone's value: cluster id (cluster mode), score percentile (score mode) or null if excluded.
- * @returns {number[]} [r, g, b, a]: grey for excluded zones, a categorical colour per cluster or the score colour,
- *   faded when another cluster or decile is highlighted.
+ * What is lit up on the map: the hovered cluster or decile, else 'gaps' while the missing-data badge is
+ * hovered or pinned, else null (nothing: every zone at full strength).
+ * @returns {?(number|string)}
  */
-const color = v => {
-  if (v === null) return highlight === null ? EXCLUDED : [...EXCLUDED.slice(0, 3), 15];
-  const group = mode === 'cluster' ? v : decile(v);
-  return [...(mode === 'cluster' ? TAB10[v % 10] : scoreColor(v)), highlight === null || highlight === group ? 255 : 25];
+const lit = () => highlight ?? (gapsPinned ? 'gaps' : null);
+/**
+ * Fill colour of a zone on the map.
+ * The lit cluster, decile or zones with missing data stand out; everything else fades.
+ * @param {?number} v - The zone's value: cluster id (cluster mode), score percentile (score mode) or null if the
+ *   zone is excluded or missing data.
+ * @param {number} i - The zone's index.
+ * @returns {number[]} [r, g, b, a]: amber for zones with missing data when they are lit, grey for excluded zones,
+ *   brown for zones without a value because of missing data, otherwise a categorical colour per cluster or the
+ *   score colour; faded when something else is lit.
+ */
+const color = (v, i) => {
+  const on = lit();
+  if (on === 'gaps') {
+    if (gapZones[i]) return [...GAP, 230];
+  } else if (v !== null && (on === null || on === (mode === 'cluster' ? v : decile(v)))) {
+    return [...(mode === 'cluster' ? TAB10[v % 10] : scoreColor(v)), 255];
+  } else if (v === null && on === null) {
+    return missing.has(i) ? NO_DATA : EXCLUDED;
+  }
+  if (v === null) return [...(missing.has(i) ? NO_DATA : EXCLUDED).slice(0, 3), 15];
+  return [...(mode === 'cluster' ? TAB10[v % 10] : scoreColor(v)), 25];
 };
+/**
+ * One tooltip row per feature to show: the switched-on ones, plus any with no value for this zone (in red),
+ * so a zone's gaps are always visible.
+ * @param {number} i - Zone index.
+ * @returns {string} Table rows as HTML.
+ */
+const featureRows = i => features.filter(f => state[f.key].on || raw[i][f.col] === null).map(f => {
+  const v = raw[i][f.col], agg = level !== baseLevel ? ` <i style="color:#5c6573">${f.agg}</i>` : '';
+  return `<tr><td>${f.label}${agg}</td>` + (v === null ? '<td class="gap">missing</td>' : `<td>${v.toLocaleString()}</td>`) + '</tr>';
+}).join('');
+/**
+ * Tooltip heading for a zone: its cluster or score percentile, or why it has none.
+ * @param {number} i - Zone index.
+ * @returns {string}
+ */
+const heading = i => vals[i] !== null ? (mode === 'cluster' ? `Cluster ${vals[i] + 1}` : `${Math.round(vals[i] * 100)}th percentile`)
+  : missing.has(i) ? (mode === 'cluster' ? 'Not clustered · missing data' : 'No score · missing data') : 'Excluded';
 
 const map = new deck.DeckGL({
   container: 'map',
@@ -190,11 +236,10 @@ const map = new deck.DeckGL({
   getTooltip: ({ object: d }) => d && {
     className: 'tip',
     style: { background: '#0c0f13ee', border: '1px solid #262c35', borderRadius: '6px', padding: '10px 12px' },
-    html: `<b>${vals[d.i] === null ? 'Excluded' : mode === 'cluster' ? `Cluster ${vals[d.i] + 1}` : `${Math.round(vals[d.i] * 100)}th percentile`}</b><br><span style="color:#8a93a3">${d.id}</span><table>` +
+    html: `<b>${heading(d.i)}</b><br><span style="color:#8a93a3">${d.id}</span><table>` +
       exclusions.filter(x => cov[x.key][d.i] > 0).map(x =>
         `<tr><td>${x.label} <i style="color:#5c6573">coverage</i></td><td>${Math.round(cov[x.key][d.i] * 100)}%</td></tr>`).join('') +
-      features.filter(f => state[f.key].on).map(f =>
-        `<tr><td>${f.label}${level !== baseLevel ? ` <i style="color:#5c6573">${f.agg}</i>` : ''}</td><td>${raw[d.i][f.col].toLocaleString()}</td></tr>`).join('') + '</table>'
+      featureRows(d.i) + '</table>'
   },
 });
 
@@ -206,10 +251,12 @@ function render() {
   map.setProps({ layers: [new deck.PolygonLayer({
     id: 'cells', data: cells,
     getPolygon: d => d.poly,
-    getFillColor: d => color(vals[d.i]),
-    getLineColor: [0, 0, 0, 60], lineWidthMinPixels: 0.5,
+    getFillColor: d => color(vals[d.i], d.i),
+    getLineColor: d => lit() === 'gaps' && gapZones[d.i] ? [...GAP, 255] : [0, 0, 0, 60],
+    getLineWidth: d => lit() === 'gaps' && gapZones[d.i] ? 1.5 : 0.5, lineWidthUnits: 'pixels',
     opacity: 0.5, pickable: true, autoHighlight: true, highlightColor: [255, 255, 255, 90],
-    updateTriggers: { getFillColor: [version, highlight] },
+    updateTriggers: { getFillColor: [version, highlight, gapsPinned], getLineColor: [version, highlight, gapsPinned],
+                      getLineWidth: [version, highlight, gapsPinned] },
     transitions: { getFillColor: 250 },
   })] });
   if (mode === 'cluster') {
@@ -219,6 +266,7 @@ function render() {
   }
   renderProfile();
   renderDeciles();
+  renderGaps();
   const n = document.getElementById('excl-count');
   if (n) n.textContent = `${excludedCount.toLocaleString()} of ${vals.length.toLocaleString()} excluded`;
 }
@@ -257,6 +305,25 @@ function renderDeciles() {
     `<span>${d * 10}th–${d === 9 ? 100 : d * 10 + 9}th</span><b>${counts[d].toLocaleString()}</b></div>`).join('');
 }
 
+/**
+ * Draw the missing-data badge under the legend: shown only when some zones of this level miss a value, with
+ * how many of them have no score (or cluster) under the current settings.
+ */
+function renderGaps() {
+  const el = document.getElementById('gaps'), n = gapZones.filter(Boolean).length;
+  el.hidden = !n;
+  if (!n) return;
+  const left = missing.size ? `<small>${missing.size.toLocaleString()} ${mode === 'cluster' ? 'not clustered' : 'without a score'}</small>` : '';
+  el.innerHTML = `⚠ Missing data · ${n.toLocaleString()} zone${n === 1 ? '' : 's'}${left}`;
+  el.classList.toggle('on', gapsPinned);
+}
+{
+  const el = document.getElementById('gaps');
+  el.addEventListener('mouseenter', () => setHighlight('gaps'));
+  el.addEventListener('mouseleave', () => setHighlight(null));
+  el.addEventListener('click', () => { gapsPinned = !gapsPinned; render(); });
+}
+
 // Hovering a cluster column or a decile row fades the other zones on the map.
 ['profile', 'deciles'].forEach(id => {
   const el = document.getElementById(id);
@@ -265,7 +332,8 @@ function renderDeciles() {
 });
 /**
  * Highlight one cluster or decile on the map, fading the others. Re-renders only if it changed.
- * @param {?number} c - Cluster id (cluster mode) or decile 0-9 (score mode), or null to clear the highlight.
+ * @param {?(number|string)} c - Cluster id (cluster mode), decile 0-9 (score mode), 'gaps' for zones with missing data,
+ *   or null to clear the highlight.
  */
 function setHighlight(c) { if (c !== highlight) { highlight = c; render(); } }
 
@@ -293,7 +361,15 @@ async function fetchValues(level, mode) {
  * @param {string} m - Mode the response was computed for: 'score' or 'cluster'.
  * @param {Object} j - Response from fetchValues().
  */
-function apply(m, j) { vals = m === 'cluster' ? j.labels : j.pct; profile = m === 'cluster' ? j : null; excludedCount = j.excluded; version++; }
+function apply(m, j) {
+  vals = m === 'cluster' ? j.labels : j.pct; profile = m === 'cluster' ? j : null; excludedCount = j.excluded;
+  missing = new Set(j.missing || []); version++;
+}
+/**
+ * Take in a level's raw values from /meta, noting which zones miss a value for any feature.
+ * @param {Array<Array<?number>>} r - Raw feature values per zone, null where missing.
+ */
+function setRaw(r) { raw = r; gapZones = r.map(row => row.some(v => v === null)); }
 /**
  * Recompute the zone values after a sidebar change and redraw.
  * Calls made while a request is in flight are coalesced into one follow-up request. A response is dropped
@@ -590,7 +666,7 @@ const flatten = zones => zones.flatMap((z, i) => z.polys.map(poly => ({ id: z.id
  */
 async function setLevel(l) {
   const [m, j] = await Promise.all([fetch(`/meta?level=${l}`).then(r => r.json()), fetchValues(l, mode)]);
-  level = l; raw = m.raw; cov = m.cov; cells = flatten(m.cells); apply(mode, j);
+  level = l; setRaw(m.raw); cov = m.cov; cells = flatten(m.cells); apply(mode, j);
   document.querySelectorAll('#res button').forEach(b => b.classList.toggle('on', b.dataset.level === l));
   render();
 }
@@ -623,7 +699,7 @@ fetch('/meta').then(r => r.json()).then(m => {
   });
   const groups = ['Core', 'Policy', 'Amenities (POI count)'];
   features = m.features.map((f, col) => ({ ...f, col })).sort((a, b) => groups.indexOf(a.group) - groups.indexOf(b.group) || a.col - b.col);
-  raw = m.raw; cov = m.cov; cells = flatten(m.cells);
+  setRaw(m.raw); cov = m.cov; cells = flatten(m.cells);
   vals = m.raw.map(() => 0.5);
   setDefaults(false);
 });

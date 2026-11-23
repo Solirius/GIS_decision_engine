@@ -220,7 +220,9 @@ def area_weighted(zones, cells, values, features):
     """Apportion base-cell values to zones by overlapping area: totals split by area share, others area-averaged.
 
     Counts (``SUMMED`` and ``poi_*`` features) are split in proportion to the share of each cell's area that
-    falls in the zone. Other features are averaged over the cells, weighted by overlapping area.
+    falls in the zone. Other features are averaged over the cells, weighted by overlapping area. A missing (NaN)
+    value in any overlapping cell makes the zone's value missing too, as does a zone no cell overlaps: nothing
+    is guessed.
 
     Args:
         zones: GeoSeries of zone polygons in BNG.
@@ -233,6 +235,7 @@ def area_weighted(zones, cells, values, features):
     """
     zi, ci = cells.sindex.query(zones.values, predicate="intersects")
     a = shapely.area(shapely.intersection(zones.values[zi], cells.values[ci]))
+    zi, ci, a = zi[a > 0], ci[a > 0], a[a > 0]  # cells that only touch the zone's edge: a gap there isn't the zone's
     w = a / shapely.area(cells.values[ci])
     X = values[ci]
     out = {}
@@ -248,7 +251,8 @@ def main():
     """Build data/levels/<level>.parquet for each zone level (H3 8, H3 7, MSOA, boroughs).
 
     Starts from the H3 resolution 8 base dataset (population, stations, distance to central London, POI
-    counts), with ``cbd_distance_m`` recomputed for every cell (see ``cbd_distance``). Downloads the planning layers and MSOA boundaries, and aggregates the base features to each level.
+    counts), keeping its missing values as they are; ``cbd_distance_m`` is recomputed for every cell (see
+    ``cbd_distance``). Downloads the planning layers and MSOA boundaries, and aggregates the base features to each level.
     Then adds Green Belt %, brownfield hectares and the coverage of each hard-exclusion layer (``cov_*``
     columns). Geometries are saved in WGS84; MSOA and borough outlines are simplified.
     """
@@ -257,9 +261,8 @@ def main():
 
     base = gpd.read_parquet(DATA / "london_physical_features.geoparquet")
     features = ["population", "station_count", "cbd_distance_m"] + [c for c in base.columns if c.startswith("poi_")]
-    raw = base[features].copy()
+    raw = base[features].copy()  # gaps are kept, never filled: the data owner decides what the tables hold
     raw["cbd_distance_m"] = cbd_distance(base.h3_id)  # derived, not observed: computed for every cell
-    raw = raw.fillna(0.0)
 
     boroughs = gpd.read_file(DATA / "london_boroughs.geojson")
     london = boroughs[["geometry"]]
@@ -285,6 +288,7 @@ def main():
     group_parts = {g: chop(pd.concat([layers[d] for d in ds]).to_crs(BNG).geometry.values) for g, ds in EXCLUSIONS.items()}
     green_belt = chop(layers["green-belt"].to_crs(BNG).geometry.values)
     brownfield = layers["brownfield-land"].to_crs(BNG)
+    # A site with no recorded area counts as 0 ha, like a zone with no recorded site: not as missing data.
     brownfield["hectares"] = pd.to_numeric(brownfield["hectares"], errors="coerce").fillna(0.0)
 
     for key, z in zones.items():
