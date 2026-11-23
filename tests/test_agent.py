@@ -20,13 +20,13 @@ def make_tools(log):
 def test_run_tool_dispatch():
     log, applied = [], []
     tools = make_tools(log)
-    assert '"zones": null' in agent.run_tool("describe_data", {}, tools, None)
-    assert agent.run_tool("preview_config", {"config_yaml": "zones: msoa"}, tools, None).startswith("{")
-    assert agent.run_tool("preview_config", {"config_yaml": "{bad"}, tools, None).startswith("Invalid config")
-    out = agent.run_tool("apply_config", {"config_yaml": "zones: msoa"}, tools, lambda c, n: applied.append((c, n)))
+    assert '"zones": null' in agent.run_tool("describe_data", "", tools, None)
+    assert agent.run_tool("preview_config", '{"config_yaml": "zones: msoa"}', tools, None).startswith("{")
+    assert agent.run_tool("preview_config", '{"config_yaml": "{bad"}', tools, None).startswith("Invalid config")
+    out = agent.run_tool("apply_config", '{"config_yaml": "zones: msoa"}', tools, lambda c, n: applied.append((c, n)))
     assert out == "Config loaded into the map (saved as agent-1.yaml)."
     assert applied == [({"zones": "msoa"}, "agent-1.yaml")]
-    assert agent.run_tool("nope", {}, tools, None) == "Unknown tool 'nope'"
+    assert agent.run_tool("nope", "{}", tools, None) == "Unknown tool 'nope'"
 
 
 class FakeOpenAI:
@@ -102,15 +102,30 @@ def test_describe_errors_go_back_to_the_model():
     def describe(level):
         raise ValueError(f"Unknown zones {level!r}")
     tools = agent.Tools(describe=describe, evaluate=None, save_config=None, claim_conversation=None)
-    assert agent.run_tool("describe_data", {"zones": "nope"}, tools, None) == "Unknown zones 'nope'"
+    assert agent.run_tool("describe_data", '{"zones": "nope"}', tools, None) == "Unknown zones 'nope'"
 
 
 def test_empty_config_is_evaluated_as_defaults():
     seen = []
     tools = agent.Tools(describe=None, evaluate=lambda cfg: seen.append(cfg) or "result", save_config=None,
                         claim_conversation=None)
-    assert agent.run_tool("preview_config", {"config_yaml": ""}, tools, None) == "result"
+    assert agent.run_tool("preview_config", '{"config_yaml": ""}', tools, None) == "result"
     assert seen == [{}]
+
+
+@pytest.mark.parametrize("args", ['{"config_yaml": "zones: msoa"', '["zones: msoa"]', '"zones: msoa"', "not json"])
+def test_malformed_arguments_go_back_to_the_model(args):
+    tools = agent.Tools(describe=lambda level: pytest.fail("must not run"), evaluate=lambda cfg: pytest.fail("no"),
+                        save_config=None, claim_conversation=None)
+    for name in ("describe_data", "apply_config"):
+        assert agent.run_tool(name, args, tools, None).startswith(f"Invalid arguments for {name}: ")
+
+
+def test_chat_carries_on_after_malformed_arguments(monkeypatch):
+    fake = ScriptedOpenAI([[call("apply_config", '{"config_yaml": ', "a")], [message("Fixed it.")]])
+    events = run(monkeypatch, fake)
+    assert [e["type"] for e in events] == ["tool", "text", "done"] and not events[-1]["error"]
+    assert fake.requests[1]["input"][0]["output"].startswith("Invalid arguments for apply_config: ")
 
 
 def test_invalid_config_is_neither_saved_nor_applied():
@@ -118,9 +133,9 @@ def test_invalid_config_is_neither_saved_nor_applied():
         raise ValueError("Unknown keys: ['nope']")
     saved = []
     tools = agent.Tools(describe=None, evaluate=evaluate, save_config=saved.append, claim_conversation=None)
-    out = agent.run_tool("apply_config", {"config_yaml": "features: {nope: {}}"}, tools, lambda *a: saved.append(a))
+    out = agent.run_tool("apply_config", '{"config_yaml": "features: {nope: {}}"}', tools, lambda *a: saved.append(a))
     assert out == "Invalid config: Unknown keys: ['nope']" and saved == []
-    assert agent.run_tool("apply_config", {}, tools, None).startswith("Invalid config")  # missing argument
+    assert agent.run_tool("apply_config", "{}", tools, None).startswith("Invalid config")  # missing argument
 
 
 # --- Registering the agent in Foundry ----------------------------------------------------------------------------

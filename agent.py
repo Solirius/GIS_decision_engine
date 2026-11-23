@@ -129,13 +129,19 @@ def run_tool(name, args, tools, on_apply):
 
     Args:
         name: Tool name: ``describe_data``, ``preview_config`` or ``apply_config``.
-        args: Tool arguments decoded from the model's JSON (``zones`` or ``config_yaml``).
+        args: Tool arguments as the model's JSON text (``zones`` or ``config_yaml``); empty means none.
         tools: The app's callbacks (``Tools``).
         on_apply: Callable(config dict, saved name) called when ``apply_config`` succeeds.
 
     Returns:
         The tool output to send back to the model, as text.
     """
+    try:
+        args = json.loads(args or "{}")
+        if not isinstance(args, dict):
+            raise ValueError("expected a JSON object")
+    except ValueError as e:  # the model wrote malformed arguments: let it try again
+        return f"Invalid arguments for {name}: {e}"
     if name == "describe_data":
         try:
             return text(tools.describe(args.get("zones")))
@@ -241,7 +247,7 @@ async def chat(message, current_config, session_id, tools):
                 elif out.type == "function_call":
                     yield {"type": "tool", "name": out.name}
                     # in a worker thread: scoring or clustering a large level must not pause other users
-                    result = await asyncio.to_thread(run_tool, out.name, json.loads(out.arguments or "{}"), tools,
+                    result = await asyncio.to_thread(run_tool, out.name, out.arguments, tools,
                                                      lambda cfg, name: applied.append((cfg, name)))
                     while applied:  # apply_config just ran: push the config to the map straight away
                         cfg, name = applied.pop(0)
