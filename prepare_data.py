@@ -37,6 +37,10 @@ EXCLUSIONS = {
 # Overture features kept from the base dataset: Core + Amenities.
 SUMMED = {"population", "station_count"}
 
+# Central London, as the H3 resolution 8 cell the base dataset measures cbd_distance_m from (Old Street area).
+CBD_CELL = "88194ad36bfffff"
+EARTH_RADIUS_M = 6371008.8  # mean Earth radius
+
 
 def get_json(url, retries=4):
     """GET a URL and decode its JSON body, retrying on failure.
@@ -151,6 +155,24 @@ def london_msoas(borough_names):
     return gdf
 
 
+def cbd_distance(h3_ids):
+    """Great-circle distance from the centre of ``CBD_CELL`` to the centre of each H3 cell, in metres.
+
+    This is how the base dataset's ``cbd_distance_m`` was computed (it matches to within centimetres), so the
+    build recomputes it for every cell rather than leaving gaps where the base dataset has none.
+
+    Args:
+        h3_ids: H3 cell ids.
+
+    Returns:
+        Array of distances in metres, one per cell.
+    """
+    lat, lng = np.radians(np.array([h3.cell_to_latlng(h) for h in h3_ids]).reshape(-1, 2)).T
+    lat0, lng0 = np.radians(h3.cell_to_latlng(CBD_CELL))
+    a = np.sin((lat - lat0) / 2) ** 2 + np.cos(lat0) * np.cos(lat) * np.sin((lng - lng0) / 2) ** 2
+    return 2 * EARTH_RADIUS_M * np.arcsin(np.sqrt(a))
+
+
 def chop(geoms, size=1000):
     """Union of `geoms` (BNG), cut into tiles of `size` metres.
 
@@ -226,7 +248,7 @@ def main():
     """Build data/levels/<level>.parquet for each zone level (H3 8, H3 7, MSOA, boroughs).
 
     Starts from the H3 resolution 8 base dataset (population, stations, distance to central London, POI
-    counts). Downloads the planning layers and MSOA boundaries, and aggregates the base features to each level.
+    counts), with ``cbd_distance_m`` recomputed for every cell (see ``cbd_distance``). Downloads the planning layers and MSOA boundaries, and aggregates the base features to each level.
     Then adds Green Belt %, brownfield hectares and the coverage of each hard-exclusion layer (``cov_*``
     columns). Geometries are saved in WGS84; MSOA and borough outlines are simplified.
     """
@@ -236,7 +258,7 @@ def main():
     base = gpd.read_parquet(DATA / "london_physical_features.geoparquet")
     features = ["population", "station_count", "cbd_distance_m"] + [c for c in base.columns if c.startswith("poi_")]
     raw = base[features].copy()
-    raw["cbd_distance_m"] = raw["cbd_distance_m"].fillna(raw["cbd_distance_m"].median())
+    raw["cbd_distance_m"] = cbd_distance(base.h3_id)  # derived, not observed: computed for every cell
     raw = raw.fillna(0.0)
 
     boroughs = gpd.read_file(DATA / "london_boroughs.geojson")

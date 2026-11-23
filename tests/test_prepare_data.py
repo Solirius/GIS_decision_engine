@@ -103,6 +103,22 @@ def test_london_msoas_pages_filters_and_caches(tmp_path, monkeypatch):
     assert list(pdata.london_msoas(set()).MSOA21CD) == ["E1", "E3"]
 
 
+def test_cbd_distance_matches_the_base_dataset():
+    base = gpd.read_parquet(pdata.DATA / "london_physical_features.geoparquet")
+    d = pdata.cbd_distance(base.h3_id)
+    known = base.cbd_distance_m.notna().to_numpy()
+    assert np.abs(d[known] - base.cbd_distance_m.to_numpy()[known]).max() < 0.1  # metres
+    assert d[base.h3_id.to_numpy() == pdata.CBD_CELL].tolist() == [0]
+    assert not np.isnan(d).any() and len(d) == len(base)
+
+
+def test_cbd_distance_of_known_places():
+    import h3
+    one_degree_north = h3.latlng_to_cell(h3.cell_to_latlng(pdata.CBD_CELL)[0] + 1, h3.cell_to_latlng(pdata.CBD_CELL)[1], 8)
+    assert pdata.cbd_distance([one_degree_north])[0] == pytest.approx(111_195, rel=0.005)  # ~111 km per degree
+    assert pdata.cbd_distance([]).shape == (0,)
+
+
 # --- Area maths (all in BNG metres) ------------------------------------------------------------------------------
 
 def test_chop_tiles_the_union():
@@ -140,6 +156,7 @@ def test_area_weighted_splits_counts_and_averages_the_rest():
     assert df.poi_shops[:2].tolist() == pytest.approx([4 + 4, 4])
     assert df.cbd_distance_m[:2].tolist() == pytest.approx([(10 * 100 + 20 * 50) / 150, 20])
     assert df.population[2] == 0 and np.isnan(df.cbd_distance_m[2])  # a zone with no cells: no mean
+
 
 
 # --- Full build ----------------------------------------------------------------------------------------------------
@@ -212,4 +229,7 @@ def test_build_keeps_totals_and_places_layers(built):
     assert b.loc["Camden", "green_belt_pct"] == pytest.approx(b.loc["Camden", "cov_flood"] * 100)
     h3 = t["h3_8"]
     assert h3.cov_flood.max() > 0.95 and (h3.cov_flood > 0).sum() > 5  # cells (nearly) inside the patch
-    assert not h3.cbd_distance_m.isna().any()  # gaps filled with the median
+    base = gpd.read_parquet(pdata.DATA / "london_physical_features.geoparquet")
+    assert base.cbd_distance_m.isna().any()  # the base dataset has gaps...
+    for k in t:
+        assert not t[k].cbd_distance_m.isna().any()  # ...but the distance is recomputed, so no level has any
