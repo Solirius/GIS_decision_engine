@@ -93,7 +93,15 @@ def test_custom_role_claim_type_is_honoured():
     assert u.roles == frozenset({"Admin"})
 
 
-@pytest.mark.parametrize("blob", ["not base64!", "bm90IGpzb24=", "//79"])  # not base64, base64 of "not json", bad UTF-8
+def b64(obj):
+    import base64
+    import json
+    return base64.b64encode(json.dumps(obj).encode()).decode()
+
+
+@pytest.mark.parametrize("blob", ["not base64!", "bm90IGpzb24=", "//79",  # not base64, base64 of "not json", bad UTF-8
+                                  b64(["roles", "Admin"]), b64("Admin"), b64({"claims": "Admin"}),  # wrong shapes
+                                  b64({"claims": [{"typ": "roles"}]}), b64({"claims": [["roles", "Admin"]]})])
 def test_unreadable_sign_in_token_means_no_roles(blob):
     u = state.user_from_headers({"x-ms-client-principal-id": "abc", "x-ms-client-principal": blob})
     assert u.id == "abc" and u.roles == frozenset()

@@ -54,7 +54,8 @@ def user_from_headers(headers, require_sign_in=False):
         require_sign_in: Refuse requests without a signed-in user instead of treating them as ``local``.
 
     Returns:
-        A ``User``. Roles come from the ``roles`` claims of the sign-in token.
+        A ``User``. Roles come from the ``roles`` claims of the sign-in token; a token that can't be read gives
+        no roles.
 
     Raises:
         PermissionError: If sign-in is required and the request has no user, or the user id is malformed.
@@ -73,8 +74,8 @@ def user_from_headers(headers, require_sign_in=False):
             p = json.loads(base64.b64decode(principal))
             role_types = {"roles", p.get("role_typ")}
             roles = {c["val"] for c in p.get("claims", []) if c.get("typ") in role_types}
-        except ValueError:
-            pass
+        except (ValueError, AttributeError, TypeError, KeyError):  # unreadable, or not the expected shape: no roles
+            roles = set()
     return User(oid, headers.get("x-ms-client-principal-name", ""), frozenset(roles))
 
 
