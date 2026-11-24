@@ -156,6 +156,14 @@ const DESC = {
   cluster: 'K-means on the percentiles of the features switched on (weights ignored). Zones missing a value for one of them are left out.',
 };
 
+/**
+ * Escape text for use in HTML, in element content or a quoted attribute. Zone ids and feature names come from
+ * the data owner's tables, so everything from the data goes through this before it reaches innerHTML.
+ * @param {*} v - Any value; it is converted to a string.
+ * @returns {string} The text with & < > " ' escaped.
+ */
+const esc = v => String(v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
 const RED = [215, 48, 39], WHITE = [255, 255, 255], GREEN = [26, 152, 80];
 /**
  * Linear interpolation between two RGB colours.
@@ -218,7 +226,7 @@ const color = (v, i) => {
  */
 const featureRows = i => features.filter(f => state[f.key].on || raw[i][f.col] === null).map(f => {
   const v = raw[i][f.col], agg = level !== baseLevel ? ` <i style="color:#5c6573">${f.agg}</i>` : '';
-  return `<tr><td>${f.label}${agg}</td>` + (v === null ? '<td class="gap">missing</td>' : `<td>${v.toLocaleString()}</td>`) + '</tr>';
+  return `<tr><td>${esc(f.label)}${agg}</td>` + (v === null ? '<td class="gap">missing</td>' : `<td>${v.toLocaleString()}</td>`) + '</tr>';
 }).join('');
 /**
  * Tooltip heading for a zone: its cluster or score percentile, or why it has none.
@@ -236,9 +244,9 @@ const map = new deck.DeckGL({
   getTooltip: ({ object: d }) => d && {
     className: 'tip',
     style: { background: '#0c0f13ee', border: '1px solid #262c35', borderRadius: '6px', padding: '10px 12px' },
-    html: `<b>${heading(d.i)}</b><br><span style="color:#8a93a3">${d.id}</span><table>` +
+    html: `<b>${heading(d.i)}</b><br><span style="color:#8a93a3">${esc(d.id)}</span><table>` +
       exclusions.filter(x => cov[x.key][d.i] > 0).map(x =>
-        `<tr><td>${x.label} <i style="color:#5c6573">coverage</i></td><td>${Math.round(cov[x.key][d.i] * 100)}%</td></tr>`).join('') +
+        `<tr><td>${esc(x.label)} <i style="color:#5c6573">coverage</i></td><td>${Math.round(cov[x.key][d.i] * 100)}%</td></tr>`).join('') +
       featureRows(d.i) + '</table>'
   },
 });
@@ -284,7 +292,7 @@ function renderProfile() {
   const dim = c => highlight !== null && highlight !== c ? ' class="dim"' : '';
   el.innerHTML = `<h3>Cluster profiles · centre percentile</h3><table><tr><th></th>` +
     profile.centers.map((_, c) => `<th data-c="${c}"${dim(c)}><i style="background:rgb(${TAB10[c % 10]})"></i>${c + 1} (${counts[c] || 0})</th>`).join('') + '</tr>' +
-    rows.map(f => { const j = profile.keys.indexOf(f.key); return `<tr><td>${f.label}</td>` + profile.centers.map((ctr, c) => {
+    rows.map(f => { const j = profile.keys.indexOf(f.key); return `<tr><td>${esc(f.label)}</td>` + profile.centers.map((ctr, c) => {
       const v = ctr[j];
       return `<td data-c="${c}"${dim(c)} style="background:rgb(${scoreColor(v / 100)});color:${Math.abs(v - 50) > 30 ? '#fff' : '#111'}">${Math.round(v)}</td>`;
     }).join('') + '</tr>'; }).join('') + '</table>';
@@ -397,8 +405,8 @@ function buildSidebar() {
   exclusions.forEach(x => {
     const e = excl[x.key], row = document.createElement('div');
     row.className = 'f' + (e.on ? '' : ' off');
-    row.innerHTML = `<div class="top"><input type="checkbox" class="sw" id="x-${x.key}" ${e.on ? 'checked' : ''}>
-      <label for="x-${x.key}">${x.label}</label><span class="w" title="Exclude if covered ≥">≥ ${Math.round(e.t * 100)}%</span></div>
+    row.innerHTML = `<div class="top"><input type="checkbox" class="sw" id="x-${esc(x.key)}" ${e.on ? 'checked' : ''}>
+      <label for="x-${esc(x.key)}">${esc(x.label)}</label><span class="w" title="Exclude if covered ≥">≥ ${Math.round(e.t * 100)}%</span></div>
       <input type="range" min="0.05" max="1" step="0.05" value="${e.t}">`;
     const [tog, tEl, slider] = [row.querySelector('.sw'), row.querySelector('.w'), row.querySelector('input[type=range]')];
     tog.onchange = () => { e.on = tog.checked; row.classList.toggle('off', !e.on); update(); };
@@ -407,11 +415,11 @@ function buildSidebar() {
   });
   let g;
   features.forEach(f => {
-    if (f.group !== g) { g = f.group; el.insertAdjacentHTML('beforeend', `<h2>${g}</h2>`); }
+    if (f.group !== g) { g = f.group; el.insertAdjacentHTML('beforeend', `<h2>${esc(g)}</h2>`); }
     const s = state[f.key], row = document.createElement('div');
     row.className = 'f' + (s.on ? '' : ' off');
-    row.innerHTML = `<div class="top"><input type="checkbox" class="sw" id="t-${f.key}" ${s.on ? 'checked' : ''}>
-      <label for="t-${f.key}" title="${f.key}">${f.label}</label><span class="w">${s.w.toFixed(2)}</span></div>
+    row.innerHTML = `<div class="top"><input type="checkbox" class="sw" id="t-${esc(f.key)}" ${s.on ? 'checked' : ''}>
+      <label for="t-${esc(f.key)}" title="${esc(f.key)}">${esc(f.label)}</label><span class="w">${s.w.toFixed(2)}</span></div>
       <input type="range" min="-1" max="1" step="0.05" value="${s.w}">`;
     const [tog, wEl, slider] = [row.querySelector('.sw'), row.querySelector('.w'), row.querySelector('input[type=range]')];
     tog.onchange = () => { s.on = tog.checked; row.classList.toggle('off', !s.on); update(); };
@@ -497,7 +505,7 @@ async function applyConfig(cfg) {
   const k = clamp(cfg.n_clusters, 1, 10, 5);
   document.getElementById('k').value = k; document.getElementById('kval').textContent = k;
   buildSidebar();
-  if (cfg.zones && cfg.zones !== level && document.querySelector(`#res button[data-level="${cfg.zones}"]`)) await setLevel(cfg.zones);
+  if (cfg.zones && cfg.zones !== level && document.querySelector(`#res button[data-level="${CSS.escape(String(cfg.zones))}"]`)) await setLevel(cfg.zones);
   if ((cfg.mode === 'score' || cfg.mode === 'cluster') && cfg.mode !== mode) await setMode(cfg.mode);
   update();
 }
