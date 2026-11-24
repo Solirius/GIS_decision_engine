@@ -238,10 +238,13 @@ To check:
 
 ## 13. Deploy automatically from GitHub
 
-*Not yet run.* [.github/workflows/deploy.yml](.github/workflows/deploy.yml) runs on every push to `main`, and from the Actions tab (**Run workflow**). It does three things:
-1. builds the image in the container registry, tagged with the commit SHA
-2. points the Container App at the new image
-3. checks that the app responds within 5 minutes
+*Not yet run.* [.github/workflows/deploy.yml](.github/workflows/deploy.yml) runs on every push to `main`, and from the Actions tab (**Run workflow**). It does four things:
+1. runs the tests ([.github/workflows/test.yml](.github/workflows/test.yml)), and stops if any fail
+2. builds the image in the container registry, tagged with the commit SHA
+3. points the Container App at the new image
+4. checks that the app responds within 5 minutes
+
+The tests also run on every pull request. They need no Azure access, so they work on any branch and on forks.
 
 GitHub signs in to Azure through OpenID Connect, as a user-assigned managed identity. There's no secret to store or rotate, and no Entra app registration is needed.
 

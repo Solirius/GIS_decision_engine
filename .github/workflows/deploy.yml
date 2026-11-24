@@ -1,4 +1,5 @@
-# Builds the container image in Azure Container Registry and rolls it out to the Container App on every push to main.
+# Runs the tests (test.yml), then builds the container image in Azure Container Registry and rolls it out to the
+# Container App on every push to main.
 # Azure sign-in is OIDC against a user-assigned managed identity, so there are no secrets: see DEPLOY.md, step 13.
 name: Deploy to Azure Container Apps
 
@@ -22,7 +23,11 @@ env:   # this instance's names: change them for a client's copy of the repo
   IMAGE: he-decision-engine
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   deploy:
+    needs: test   # a failing test stops the deploy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
